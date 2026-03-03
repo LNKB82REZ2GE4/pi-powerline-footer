@@ -35,6 +35,9 @@ export type StatusLineSegmentId =
   | "token_out"
   | "token_total"
   | "cost"
+  | "sub_5hr"
+  | "sub_weekly"
+  | "sub_monthly"
   | "context_pct"
   | "context_total"
   | "time_spent"
@@ -120,6 +123,19 @@ export interface UsageStats {
   cost: number;
 }
 
+// Subscription window usage (from pi-sub-core events)
+export interface SubscriptionWindow {
+  label?: string;
+  resetDescription?: string;
+  usedPercent: number;
+}
+
+export interface SubscriptionUsage {
+  fiveHour?: SubscriptionWindow;
+  weekly?: SubscriptionWindow;
+  monthly?: SubscriptionWindow;
+}
+
 // Context passed to segment render functions
 export interface SegmentContext {
   // From pi-mono
@@ -129,6 +145,7 @@ export interface SegmentContext {
   
   // Computed
   usageStats: UsageStats;
+  subscriptionUsage: SubscriptionUsage;
   contextPercent: number;
   contextWindow: number;
   autoCompactEnabled: boolean;

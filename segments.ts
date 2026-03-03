@@ -35,6 +35,31 @@ function formatDuration(ms: number): string {
   return `${seconds}s`;
 }
 
+function subscriptionSemanticColor(pct: number): SemanticColor {
+  if (pct > 80) return "contextError";
+  if (pct > 60) return "contextWarn";
+  return "tokens";
+}
+
+function renderProgressBar(percent: number, width = 8): string {
+  const clamped = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((clamped / 100) * width);
+  const empty = Math.max(0, width - filled);
+  return `[${"█".repeat(filled)}${"░".repeat(empty)}]`;
+}
+
+function renderSubscriptionWindow(ctx: SegmentContext, window: SegmentContext["subscriptionUsage"]["weekly"]): RenderedSegment {
+  if (!window) return { content: "", visible: false };
+
+  const pct = Math.round(window.usedPercent);
+  const label = window.label?.trim() ?? "Sub";
+  const reset = window.resetDescription?.trim() ?? "";
+  const bar = renderProgressBar(pct);
+  const text = reset ? `${label} ${reset}` : label;
+  const content = `${text} ${pct}% ${bar}`;
+  return { content: color(ctx, subscriptionSemanticColor(pct), content), visible: true };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Segment Implementations
 // ═══════════════════════════════════════════════════════════════════════════
@@ -257,6 +282,27 @@ const costSegment: StatusLineSegment = {
   },
 };
 
+const sub5HrSegment: StatusLineSegment = {
+  id: "sub_5hr",
+  render(ctx) {
+    return renderSubscriptionWindow(ctx, ctx.subscriptionUsage.fiveHour);
+  },
+};
+
+const subWeeklySegment: StatusLineSegment = {
+  id: "sub_weekly",
+  render(ctx) {
+    return renderSubscriptionWindow(ctx, ctx.subscriptionUsage.weekly);
+  },
+};
+
+const subMonthlySegment: StatusLineSegment = {
+  id: "sub_monthly",
+  render(ctx) {
+    return renderSubscriptionWindow(ctx, ctx.subscriptionUsage.monthly);
+  },
+};
+
 const contextPctSegment: StatusLineSegment = {
   id: "context_pct",
   render(ctx) {
@@ -265,9 +311,10 @@ const contextPctSegment: StatusLineSegment = {
     const window = ctx.contextWindow;
 
     const autoIcon = ctx.autoCompactEnabled && icons.auto ? ` ${icons.auto}` : "";
-    const text = `${pct.toFixed(1)}%/${formatTokens(window)}${autoIcon}`;
+    const bar = renderProgressBar(pct);
+    const text = `${pct.toFixed(1)}%/${formatTokens(window)}${autoIcon} ${bar}`;
 
-    // Icon outside color, text inside - use semantic colors for thresholds
+    // Icon outside color, text+bar inside - use semantic colors for thresholds
     let content: string;
     if (pct > 90) {
       content = withIcon(icons.context, color(ctx, "contextError", text));
@@ -421,6 +468,9 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
   token_out: tokenOutSegment,
   token_total: tokenTotalSegment,
   cost: costSegment,
+  sub_5hr: sub5HrSegment,
+  sub_weekly: subWeeklySegment,
+  sub_monthly: subMonthlySegment,
   context_pct: contextPctSegment,
   context_total: contextTotalSegment,
   time_spent: timeSpentSegment,

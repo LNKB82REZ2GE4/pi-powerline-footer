@@ -4,7 +4,14 @@ import { visibleWidth } from "@mariozechner/pi-tui";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
-import type { ColorScheme, SegmentContext, StatusLinePreset, StatusLineSegmentId } from "./types.js";
+import type {
+  ColorScheme,
+  SegmentContext,
+  StatusLinePreset,
+  StatusLineSegmentId,
+  SubscriptionUsage,
+  SubscriptionWindow,
+} from "./types.js";
 import { getPreset, PRESETS } from "./presets.js";
 import { getSeparator } from "./separators.js";
 import { renderSegment } from "./segments.js";
@@ -69,6 +76,120 @@ function readShowLastPromptSetting(): boolean {
   } catch {}
   
   return true;
+}
+
+interface SubCoreUsageSnapshot {
+  windows?: SubscriptionWindow[];
+}
+
+interface SubCoreState {
+  usage?: SubCoreUsageSnapshot;
+}
+
+interface SubCoreEntryState {
+  provider?: string;
+  usage?: SubCoreUsageSnapshot;
+}
+
+interface SubCoreAllState {
+  provider?: string;
+  entries?: SubCoreEntryState[];
+}
+
+interface SubCoreCurrentPayload {
+  state?: SubCoreState;
+}
+
+interface SubCoreAllPayload {
+  state?: SubCoreAllState;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function coerceUsageSnapshot(value: unknown): SubCoreUsageSnapshot | undefined {
+  if (!isObject(value)) return undefined;
+  const windows = value.windows;
+  if (!Array.isArray(windows)) return undefined;
+
+  const parsedWindows: SubscriptionWindow[] = [];
+  for (const window of windows) {
+    if (!isObject(window) || typeof window.usedPercent !== "number") {
+      continue;
+    }
+
+    const boundedPercent = Math.max(0, Math.min(100, window.usedPercent));
+    parsedWindows.push({
+      usedPercent: boundedPercent,
+      label: typeof window.label === "string" ? window.label : undefined,
+      resetDescription: typeof window.resetDescription === "string" ? window.resetDescription : undefined,
+    });
+  }
+
+  return { windows: parsedWindows };
+}
+
+function pickWindowByLabel(
+  windows: SubscriptionWindow[],
+  labelMatcher: RegExp
+): SubscriptionWindow | undefined {
+  return windows.find((window) => labelMatcher.test((window.label ?? "").toLowerCase()));
+}
+
+function mapSubscriptionUsage(usage: SubCoreUsageSnapshot | undefined): SubscriptionUsage {
+  const windows = usage?.windows ?? [];
+
+  // z.ai currently reports 5h usage under "Tokens" and tool quota under "Monthly".
+  const tokenWindow = pickWindowByLabel(windows, /(^|\s)tokens?(\s|$)/);
+  const explicitFiveHour = pickWindowByLabel(windows, /(^|\s)(5h|5hr|5-hour)(\s|$)/);
+  const weekly = pickWindowByLabel(windows, /(^|\s)(week|7d|weekly)(\s|$)/);
+  const monthly = pickWindowByLabel(windows, /(^|\s)(month|30d|monthly)(\s|$)/);
+
+  const fiveHour = explicitFiveHour ?? tokenWindow;
+
+  // If this looks like z.ai shape (Tokens + Monthly, no weekly), relabel monthly for clarity.
+  const normalizedMonthly =
+    tokenWindow && monthly && !weekly
+      ? { ...monthly, label: "Monthly tools" }
+      : monthly;
+
+  return {
+    // Prefer explicit labels so provider-specific ordering does not mis-map windows.
+    fiveHour,
+    weekly,
+    monthly: normalizedMonthly,
+  };
+}
+
+function parseCurrentStatePayload(payload: unknown): SubCoreCurrentPayload {
+  if (!isObject(payload)) return {};
+  const state = payload.state;
+  if (!isObject(state)) return {};
+  return { state: { usage: coerceUsageSnapshot(state.usage) } };
+}
+
+function parseAllStatePayload(payload: unknown): SubCoreAllPayload {
+  if (!isObject(payload)) return {};
+
+  const stateValue = payload.state;
+  if (!isObject(stateValue)) return {};
+
+  const provider = typeof stateValue.provider === "string" ? stateValue.provider : undefined;
+  const entriesValue = stateValue.entries;
+  const entries: SubCoreEntryState[] = [];
+
+  if (Array.isArray(entriesValue)) {
+    for (const entry of entriesValue) {
+      if (!isObject(entry)) continue;
+      entries.push({
+        provider: typeof entry.provider === "string" ? entry.provider : undefined,
+        usage: coerceUsageSnapshot(entry.usage),
+      });
+    }
+  }
+
+  return { state: { provider, entries } };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -188,6 +309,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   let welcomeOverlayShouldDismiss = false; // Track early dismissal request (before overlay setup completes)
   let lastUserPrompt = ""; // Track last user message for "what did I type?" reminder
   let showLastPrompt = true; // Cached setting for last prompt visibility
+  let subscriptionUsage: SubscriptionUsage = {};
   
   // Cache for responsive layout (shared between editor and widget for consistency)
   let lastLayoutWidth = 0;
@@ -201,6 +323,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     lastUserPrompt = "";
     isStreaming = false;
     showLastPrompt = readShowLastPromptSetting();
+    subscriptionUsage = {};
     
     // Store thinking level getter if available
     if (typeof ctx.getThinkingLevel === 'function') {
@@ -219,6 +342,33 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         setupWelcomeOverlay(ctx);
       }
     }
+  });
+
+  const updateSubscriptionUsage = (usage: SubCoreUsageSnapshot | undefined): void => {
+    subscriptionUsage = mapSubscriptionUsage(usage);
+    lastLayoutResult = null;
+    tuiRef?.requestRender();
+  };
+
+  pi.events.on("sub-core:ready", (payload: unknown) => {
+    const data = parseCurrentStatePayload(payload);
+    updateSubscriptionUsage(data.state?.usage);
+  });
+
+  pi.events.on("sub-core:update-current", (payload: unknown) => {
+    const data = parseCurrentStatePayload(payload);
+    updateSubscriptionUsage(data.state?.usage);
+  });
+
+  pi.events.on("sub-core:update-all", (payload: unknown) => {
+    const data = parseAllStatePayload(payload);
+    const provider = data.state?.provider;
+    const entries = data.state?.entries ?? [];
+    const match = provider
+      ? entries.find((entry) => entry.provider === provider)
+      : entries[0];
+
+    updateSubscriptionUsage(match?.usage);
   });
 
   // Check if a bash command might change git branch
@@ -545,6 +695,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       thinkingLevel: thinkingLevelFromSession || getThinkingLevelFn?.() || "off",
       sessionId: ctx.sessionManager?.getSessionId?.(),
       usageStats: { input, output, cacheRead, cacheWrite, cost },
+      subscriptionUsage,
       contextPercent,
       contextWindow,
       autoCompactEnabled: ctx.settingsManager?.getCompactionSettings?.()?.enabled ?? true,

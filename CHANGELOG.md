@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+- Added `sub_5hr`, `sub_weekly`, and `sub_monthly` segments to show subscription usage from `pi-sub-core` directly in the powerline footer.
+- Added `pi-sub-core` as a bundled sibling extension dependency so subscription events are available without `pi-powerbar`.
+
+### Changed
+- Subscription segments now render full window labels + reset text with inline progress bars.
+- Updated default/full/nerd presets to place subscription usage segments at the end of the status line.
+- Context usage segment now includes an inline progress bar while preserving existing color thresholds and context text format.
+- Subscription mapping now treats `Tokens` windows as a 5-hour fallback (helps z.ai where 5h is exposed as token quota).
+- When usage matches z.ai's `Tokens + Monthly` shape, monthly is relabeled to `Monthly tools` for clarity.
+
 ## [0.3.1] - 2026-02-28
 
 ### Changed

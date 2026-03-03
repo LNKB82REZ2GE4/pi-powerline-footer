@@ -22,9 +22,11 @@ Customizes the default [pi](https://github.com/badlogic/pi-mono) editor with a p
 
 **Git integration** — Async status fetching with 1s cache TTL. Automatically invalidates on file writes/edits. Shows branch, staged (+), unstaged (*), and untracked (?) counts.
 
-**Context awareness** — Color-coded warnings at 70% (yellow) and 90% (red) context usage. Auto-compact indicator when enabled.
+**Context awareness** — Color-coded warnings at 70% (yellow) and 90% (red) context usage, now with an inline progress bar next to ` 0.0%/205k`. Auto-compact indicator when enabled.
 
 **Token intelligence** — Smart formatting (1.2k, 45M), subscription detection (shows "(sub)" vs dollar cost).
+
+**Subscription windows** — 5-hour, weekly, and monthly usage from `pi-sub-core`, shown with full label/reset text and inline progress bars (for example `Week resets in 2d 34% [███░░░░░░]`).
 
 ## Installation
 
@@ -143,7 +145,7 @@ Configure via preset options: `path: { mode: "full" }`
 
 ## Segments
 
-`pi` · `model` · `thinking` · `path` · `git` · `subagents` · `token_in` · `token_out` · `token_total` · `cost` · `context_pct` · `context_total` · `time_spent` · `time` · `session` · `hostname` · `cache_read` · `cache_write`
+`pi` · `model` · `thinking` · `path` · `git` · `subagents` · `token_in` · `token_out` · `token_total` · `cost` · `sub_5hr` · `sub_weekly` · `sub_monthly` · `context_pct` · `context_total` · `time_spent` · `time` · `session` · `hostname` · `cache_read` · `cache_write`
 
 ## Separators
 

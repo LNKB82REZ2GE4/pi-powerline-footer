@@ -28,7 +28,11 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./index.ts",
+      "node_modules/@marckrenn/pi-sub-core/index.ts"
     ]
+  },
+  "dependencies": {
+    "@marckrenn/pi-sub-core": "^1.3.0"
   }
 }

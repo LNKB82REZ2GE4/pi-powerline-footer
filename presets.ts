@@ -27,7 +27,7 @@ const NERD_COLORS: ColorScheme = {
 export const PRESETS: Record<StatusLinePreset, PresetDef> = {
   default: {
     leftSegments: ["pi", "model", "thinking", "path", "git", "context_pct", "cache_read", "cost"],
-    rightSegments: [],
+    rightSegments: ["sub_5hr", "sub_weekly", "sub_monthly"],
     secondarySegments: ["extension_statuses"],
     separator: "powerline-thin",
     colors: DEFAULT_COLORS,
@@ -62,7 +62,7 @@ export const PRESETS: Record<StatusLinePreset, PresetDef> = {
 
   full: {
     leftSegments: ["pi", "hostname", "model", "thinking", "path", "git", "subagents"],
-    rightSegments: ["token_in", "token_out", "cache_read", "cost", "context_pct", "time_spent", "time", "extension_statuses"],
+    rightSegments: ["token_in", "token_out", "cache_read", "cost", "context_pct", "time_spent", "time", "extension_statuses", "sub_5hr", "sub_weekly", "sub_monthly"],
     separator: "powerline",
     colors: DEFAULT_COLORS,
     segmentOptions: {
@@ -75,7 +75,7 @@ export const PRESETS: Record<StatusLinePreset, PresetDef> = {
 
   nerd: {
     leftSegments: ["pi", "hostname", "model", "thinking", "path", "git", "session", "subagents"],
-    rightSegments: ["token_in", "token_out", "cache_read", "cache_write", "cost", "context_pct", "context_total", "time_spent", "time", "extension_statuses"],
+    rightSegments: ["token_in", "token_out", "cache_read", "cache_write", "cost", "context_pct", "context_total", "time_spent", "time", "extension_statuses", "sub_5hr", "sub_weekly", "sub_monthly"],
     separator: "powerline",
     colors: NERD_COLORS,
     segmentOptions: {
