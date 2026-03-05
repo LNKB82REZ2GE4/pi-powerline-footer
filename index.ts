@@ -325,6 +325,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   let showLastPrompt = true; // Cached setting for last prompt visibility
   let subscriptionUsage: SubscriptionUsage = {};
   let localLlmLive: { modelName?: string; contextWindow?: number } | null = null;
+  let latestSubAllState: { provider?: string; entries: SubCoreEntryState[] } | null = null;
   
   // Cache for responsive layout (shared between editor and widget for consistency)
   let lastLayoutWidth = 0;
@@ -348,6 +349,10 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     // Initialize vibe manager (needs modelRegistry from ctx)
     initVibeManager(ctx);
     
+    // If we already have provider-wide subscription snapshots cached,
+    // remap immediately for the active model provider.
+    remapSubscriptionFromLatestAllState();
+
     if (enabled && ctx.hasUI) {
       setupCustomEditor(ctx);
       // quietStartup: true → compact header, otherwise → full overlay
@@ -365,6 +370,31 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     tuiRef?.requestRender();
   };
 
+  const remapSubscriptionFromLatestAllState = (): void => {
+    const state = latestSubAllState;
+    if (!state) return;
+
+    const entries = state.entries ?? [];
+    const currentProvider = currentCtx?.model?.provider as string | undefined;
+
+    // 1) Prefer current active model provider
+    let match = currentProvider
+      ? entries.find((entry) => providerMatches(entry.provider, currentProvider))
+      : undefined;
+
+    // 2) Fall back to provider indicated by sub-core state
+    if (!match && state.provider) {
+      match = entries.find((entry) => providerMatches(entry.provider, state.provider));
+    }
+
+    // 3) Last resort: first entry
+    if (!match) {
+      match = entries[0];
+    }
+
+    updateSubscriptionUsage(match?.usage);
+  };
+
   pi.events.on("sub-core:ready", (payload: unknown) => {
     const data = parseCurrentStatePayload(payload);
     updateSubscriptionUsage(data.state?.usage);
@@ -377,16 +407,11 @@ export default function powerlineFooter(pi: ExtensionAPI) {
 
   pi.events.on("sub-core:update-all", (payload: unknown) => {
     const data = parseAllStatePayload(payload);
-    const entries = data.state?.entries ?? [];
-    const currentProvider = currentCtx?.model?.provider as string | undefined;
-    const stateProvider = data.state?.provider;
-
-    const preferredProvider = currentProvider ?? stateProvider;
-    const match = preferredProvider
-      ? entries.find((entry) => providerMatches(entry.provider, preferredProvider))
-      : entries[0];
-
-    updateSubscriptionUsage(match?.usage);
+    latestSubAllState = {
+      provider: data.state?.provider,
+      entries: data.state?.entries ?? [],
+    };
+    remapSubscriptionFromLatestAllState();
   });
 
   pi.events.on("local-llm:update", (payload: unknown) => {
@@ -399,6 +424,21 @@ export default function powerlineFooter(pi: ExtensionAPI) {
         contextWindow: typeof p?.contextWindow === "number" ? p.contextWindow : undefined,
       };
     }
+    lastLayoutResult = null;
+    tuiRef?.requestRender();
+  });
+
+  // Keep footer in sync when switching models/sessions without waiting for turn events.
+  pi.on("model_select", async (_event, ctx) => {
+    currentCtx = ctx;
+    remapSubscriptionFromLatestAllState();
+    lastLayoutResult = null;
+    tuiRef?.requestRender();
+  });
+
+  pi.on("session_switch", async (_event, ctx) => {
+    currentCtx = ctx;
+    remapSubscriptionFromLatestAllState();
     lastLayoutResult = null;
     tuiRef?.requestRender();
   });
