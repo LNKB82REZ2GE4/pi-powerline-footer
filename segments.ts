@@ -285,6 +285,8 @@ const costSegment: StatusLineSegment = {
 const sub5HrSegment: StatusLineSegment = {
   id: "sub_5hr",
   render(ctx) {
+    // Local/self-hosted providers should not show hosted subscription quota windows.
+    if (ctx.model?.provider === "llamacpp") return { content: "", visible: false };
     return renderSubscriptionWindow(ctx, ctx.subscriptionUsage.fiveHour);
   },
 };
@@ -292,6 +294,7 @@ const sub5HrSegment: StatusLineSegment = {
 const subWeeklySegment: StatusLineSegment = {
   id: "sub_weekly",
   render(ctx) {
+    if (ctx.model?.provider === "llamacpp") return { content: "", visible: false };
     return renderSubscriptionWindow(ctx, ctx.subscriptionUsage.weekly);
   },
 };
@@ -299,6 +302,7 @@ const subWeeklySegment: StatusLineSegment = {
 const subMonthlySegment: StatusLineSegment = {
   id: "sub_monthly",
   render(ctx) {
+    if (ctx.model?.provider === "llamacpp") return { content: "", visible: false };
     return renderSubscriptionWindow(ctx, ctx.subscriptionUsage.monthly);
   },
 };
