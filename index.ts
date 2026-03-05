@@ -147,22 +147,28 @@ function pickWindowByLabel(
 function mapSubscriptionUsage(usage: SubCoreUsageSnapshot | undefined): SubscriptionUsage {
   const windows = usage?.windows ?? [];
 
-  // z.ai currently reports 5h usage under "Tokens" and tool quota under "Monthly".
+  // Label-based detection first (best accuracy when labels are present)
   const tokenWindow = pickWindowByLabel(windows, /(^|\s)tokens?(\s|$)/);
   const explicitFiveHour = pickWindowByLabel(windows, /(^|\s)(5h|5hr|5-hour)(\s|$)/);
-  const weekly = pickWindowByLabel(windows, /(^|\s)(week|7d|weekly)(\s|$)/);
-  const monthly = pickWindowByLabel(windows, /(^|\s)(month|30d|monthly)(\s|$)/);
+  const explicitWeekly = pickWindowByLabel(windows, /(^|\s)(week|7d|weekly)(\s|$)/);
+  const explicitMonthly = pickWindowByLabel(windows, /(^|\s)(month|30d|monthly)(\s|$)/);
 
-  const fiveHour = explicitFiveHour ?? tokenWindow;
+  // Robust fallback: if labels are missing/changed, fall back to positional windows.
+  const fallbackFiveHour = windows[0];
+  const fallbackWeekly = windows[1];
+  const fallbackMonthly = windows[2];
+
+  const fiveHour = explicitFiveHour ?? tokenWindow ?? fallbackFiveHour;
+  const weekly = explicitWeekly ?? fallbackWeekly;
+  const monthly = explicitMonthly ?? fallbackMonthly;
 
   // If this looks like z.ai shape (Tokens + Monthly, no weekly), relabel monthly for clarity.
   const normalizedMonthly =
-    tokenWindow && monthly && !weekly
+    tokenWindow && monthly && !explicitWeekly
       ? { ...monthly, label: "Monthly tools" }
       : monthly;
 
   return {
-    // Prefer explicit labels so provider-specific ordering does not mis-map windows.
     fiveHour,
     weekly,
     monthly: normalizedMonthly,
@@ -199,10 +205,26 @@ function parseAllStatePayload(payload: unknown): SubCoreAllPayload {
   return { state: { provider, entries } };
 }
 
+function normalizeProviderName(p?: string): string | undefined {
+  if (!p) return undefined;
+  const v = p.toLowerCase();
+
+  // Map pi model-provider identifiers to sub-core provider names.
+  if (v === "openai-codex" || v.includes("codex")) return "codex";
+  if (v === "google" || v.includes("gemini")) return "gemini";
+  if (v === "anthropic") return "anthropic";
+  if (v === "zai") return "zai";
+  if (v === "github-copilot" || v.includes("copilot")) return "copilot";
+  if (v.includes("antigravity")) return "antigravity";
+  if (v.includes("kiro")) return "kiro";
+
+  return v;
+}
+
 function providerMatches(a?: string, b?: string): boolean {
-  if (!a || !b) return false;
-  const x = a.toLowerCase();
-  const y = b.toLowerCase();
+  const x = normalizeProviderName(a);
+  const y = normalizeProviderName(b);
+  if (!x || !y) return false;
   return x === y || x.startsWith(y) || y.startsWith(x);
 }
 
