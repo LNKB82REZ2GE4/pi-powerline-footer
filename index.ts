@@ -78,20 +78,11 @@ function readShowLastPromptSetting(): boolean {
   return true;
 }
 
-interface SubCoreUsageError {
-  code?: string;
-  message?: string;
-  httpStatus?: number;
-}
-
 interface SubCoreUsageSnapshot {
-  provider?: string;
   windows?: SubscriptionWindow[];
-  error?: SubCoreUsageError;
 }
 
 interface SubCoreState {
-  provider?: string;
   usage?: SubCoreUsageSnapshot;
 }
 
@@ -101,7 +92,6 @@ interface SubCoreEntryState {
 }
 
 interface LocalLlmUpdatePayload {
-  modelId?: string;
   modelName?: string;
   contextWindow?: number;
   unavailable?: boolean;
@@ -140,24 +130,10 @@ function coerceUsageSnapshot(value: unknown): SubCoreUsageSnapshot | undefined {
       usedPercent: boundedPercent,
       label: typeof window.label === "string" ? window.label : undefined,
       resetDescription: typeof window.resetDescription === "string" ? window.resetDescription : undefined,
-      resetAt: typeof window.resetAt === "string" ? window.resetAt : undefined,
     });
   }
 
-  const errorValue = value.error;
-  const error = isObject(errorValue)
-    ? {
-        code: typeof errorValue.code === "string" ? errorValue.code : undefined,
-        message: typeof errorValue.message === "string" ? errorValue.message : undefined,
-        httpStatus: typeof errorValue.httpStatus === "number" ? errorValue.httpStatus : undefined,
-      }
-    : undefined;
-
-  return {
-    provider: typeof value.provider === "string" ? value.provider : undefined,
-    windows: parsedWindows,
-    error,
-  };
+  return { windows: parsedWindows };
 }
 
 function pickWindowByLabel(
@@ -170,43 +146,22 @@ function pickWindowByLabel(
 function mapSubscriptionUsage(usage: SubCoreUsageSnapshot | undefined): SubscriptionUsage {
   const windows = usage?.windows ?? [];
 
-  // Label-based detection first (best accuracy when labels are present)
+  // z.ai currently reports 5h usage under "Tokens" and tool quota under "Monthly".
   const tokenWindow = pickWindowByLabel(windows, /(^|\s)tokens?(\s|$)/);
   const explicitFiveHour = pickWindowByLabel(windows, /(^|\s)(5h|5hr|5-hour)(\s|$)/);
-  const explicitWeekly = pickWindowByLabel(windows, /(^|\s)(week|7d|weekly)(\s|$)/);
-  const explicitMonthly = pickWindowByLabel(windows, /(^|\s)(month|30d|monthly)(\s|$)/);
+  const weekly = pickWindowByLabel(windows, /(^|\s)(week|7d|weekly)(\s|$)/);
+  const monthly = pickWindowByLabel(windows, /(^|\s)(month|30d|monthly)(\s|$)/);
 
-  // Robust fallback: if labels are missing/changed, fall back to positional windows.
-  const fallbackFiveHour = windows[0];
-  const fallbackWeekly = windows[1];
-  const fallbackMonthly = windows[2];
-
-  let fiveHour = explicitFiveHour ?? tokenWindow ?? fallbackFiveHour;
-  const weekly = explicitWeekly ?? fallbackWeekly;
-  const monthly = explicitMonthly ?? fallbackMonthly;
+  const fiveHour = explicitFiveHour ?? tokenWindow;
 
   // If this looks like z.ai shape (Tokens + Monthly, no weekly), relabel monthly for clarity.
   const normalizedMonthly =
-    tokenWindow && monthly && !explicitWeekly
+    tokenWindow && monthly && !weekly
       ? { ...monthly, label: "Monthly tools" }
       : monthly;
 
-  // Anthropic can return HTTP 429 for usage endpoint when capped.
-  // In that case, stale fallback windows are misleading — force 5h to 100%.
-  const isRateLimited =
-    usage?.error?.httpStatus === 429 ||
-    (usage?.error?.code === "HTTP_ERROR" && /429/.test(usage?.error?.message ?? ""));
-  const isAnthropic = normalizeProviderName(usage?.provider) === "anthropic";
-
-  if (isAnthropic && isRateLimited) {
-    fiveHour = {
-      label: fiveHour?.label ?? "5h",
-      usedPercent: 100,
-      resetDescription: fiveHour?.resetDescription,
-    };
-  }
-
   return {
+    // Prefer explicit labels so provider-specific ordering does not mis-map windows.
     fiveHour,
     weekly,
     monthly: normalizedMonthly,
@@ -217,12 +172,7 @@ function parseCurrentStatePayload(payload: unknown): SubCoreCurrentPayload {
   if (!isObject(payload)) return {};
   const state = payload.state;
   if (!isObject(state)) return {};
-  return {
-    state: {
-      provider: typeof state.provider === "string" ? state.provider : undefined,
-      usage: coerceUsageSnapshot(state.usage),
-    },
-  };
+  return { state: { usage: coerceUsageSnapshot(state.usage) } };
 }
 
 function parseAllStatePayload(payload: unknown): SubCoreAllPayload {
@@ -246,29 +196,6 @@ function parseAllStatePayload(payload: unknown): SubCoreAllPayload {
   }
 
   return { state: { provider, entries } };
-}
-
-function normalizeProviderName(p?: string): string | undefined {
-  if (!p) return undefined;
-  const v = p.toLowerCase();
-
-  // Map pi model-provider identifiers to sub-core provider names.
-  if (v === "openai-codex" || v.includes("codex")) return "codex";
-  if (v === "google" || v.includes("gemini")) return "gemini";
-  if (v === "anthropic") return "anthropic";
-  if (v === "zai") return "zai";
-  if (v === "github-copilot" || v.includes("copilot")) return "copilot";
-  if (v.includes("antigravity")) return "antigravity";
-  if (v.includes("kiro")) return "kiro";
-
-  return v;
-}
-
-function providerMatches(a?: string, b?: string): boolean {
-  const x = normalizeProviderName(a);
-  const y = normalizeProviderName(b);
-  if (!x || !y) return false;
-  return x === y || x.startsWith(y) || y.startsWith(x);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -390,8 +317,6 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   let showLastPrompt = true; // Cached setting for last prompt visibility
   let subscriptionUsage: SubscriptionUsage = {};
   let localLlmLive: { modelName?: string; contextWindow?: number } | null = null;
-  let latestSubAllState: { provider?: string; entries: SubCoreEntryState[] } | null = null;
-  let lastForcedSubRefreshAt = 0;
   
   // Cache for responsive layout (shared between editor and widget for consistency)
   let lastLayoutWidth = 0;
@@ -415,10 +340,6 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     // Initialize vibe manager (needs modelRegistry from ctx)
     initVibeManager(ctx);
     
-    // If we already have provider-wide subscription snapshots cached,
-    // remap immediately for the active model provider.
-    remapSubscriptionFromLatestAllState();
-
     if (enabled && ctx.hasUI) {
       setupCustomEditor(ctx);
       // quietStartup: true → compact header, otherwise → full overlay
@@ -436,63 +357,29 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     tuiRef?.requestRender();
   };
 
-  const shouldAcceptUsageForCurrentProvider = (payloadProvider?: string, usageProvider?: string): boolean => {
-    const currentProvider = normalizeProviderName(currentCtx?.model?.provider as string | undefined);
-    if (!currentProvider) return true;
-
-    const candidate = normalizeProviderName(payloadProvider) ?? normalizeProviderName(usageProvider);
-    if (!candidate) return false;
-    return providerMatches(candidate, currentProvider);
-  };
-
-  const remapSubscriptionFromLatestAllState = (): void => {
-    const state = latestSubAllState;
-    if (!state) return;
-
-    const entries = state.entries ?? [];
-    const currentProvider = currentCtx?.model?.provider as string | undefined;
-
-    // 1) Prefer current active model provider
-    let match = currentProvider
-      ? entries.find((entry) => providerMatches(entry.provider, currentProvider))
-      : undefined;
-
-    // 2) Fall back to provider indicated by sub-core state only if it matches current
-    if (!match && state.provider && shouldAcceptUsageForCurrentProvider(state.provider, undefined)) {
-      match = entries.find((entry) => providerMatches(entry.provider, state.provider));
-    }
-
-    // If we couldn't find a matching entry for the active provider, hide bars
-    // instead of showing another provider's stale quota windows.
-    if (!match) {
-      updateSubscriptionUsage(undefined);
-      return;
-    }
-
-    updateSubscriptionUsage(match.usage);
-  };
-
   pi.events.on("sub-core:ready", (payload: unknown) => {
     const data = parseCurrentStatePayload(payload);
-    if (!shouldAcceptUsageForCurrentProvider(data.state?.provider, data.state?.usage?.provider)) return;
     updateSubscriptionUsage(data.state?.usage);
   });
 
   pi.events.on("sub-core:update-current", (payload: unknown) => {
     const data = parseCurrentStatePayload(payload);
-    if (!shouldAcceptUsageForCurrentProvider(data.state?.provider, data.state?.usage?.provider)) return;
     updateSubscriptionUsage(data.state?.usage);
   });
 
   pi.events.on("sub-core:update-all", (payload: unknown) => {
     const data = parseAllStatePayload(payload);
-    latestSubAllState = {
-      provider: data.state?.provider,
-      entries: data.state?.entries ?? [],
-    };
-    remapSubscriptionFromLatestAllState();
+    const provider = data.state?.provider;
+    const entries = data.state?.entries ?? [];
+    const match = provider
+      ? entries.find((entry) => entry.provider === provider)
+      : entries[0];
+
+    updateSubscriptionUsage(match?.usage);
   });
 
+  // Optional metadata from pi-local-llm extension so local model name/context
+  // can reflect the actual model served on :8080.
   pi.events.on("local-llm:update", (payload: unknown) => {
     const p = payload as LocalLlmUpdatePayload;
     if (p?.unavailable) {
@@ -507,32 +394,17 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     tuiRef?.requestRender();
   });
 
-  // Keep footer in sync when switching models/sessions without waiting for turn events.
+  // Keep footer context in sync when switching models quickly (Ctrl+P).
   pi.on("model_select", async (_event, ctx) => {
     currentCtx = ctx;
-    remapSubscriptionFromLatestAllState();
     lastLayoutResult = null;
     tuiRef?.requestRender();
-
-    // Request a fresh provider-specific snapshot after model switch.
-    const now = Date.now();
-    if (now - lastForcedSubRefreshAt > 10_000) {
-      lastForcedSubRefreshAt = now;
-      pi.events.emit("sub-core:action", { type: "refresh", force: true });
-    }
   });
 
   pi.on("session_switch", async (_event, ctx) => {
     currentCtx = ctx;
-    remapSubscriptionFromLatestAllState();
     lastLayoutResult = null;
     tuiRef?.requestRender();
-
-    const now = Date.now();
-    if (now - lastForcedSubRefreshAt > 10_000) {
-      lastForcedSubRefreshAt = now;
-      pi.events.emit("sub-core:action", { type: "refresh", force: true });
-    }
   });
 
   // Check if a bash command might change git branch
@@ -646,47 +518,10 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     }
   }
 
-  function getLatestAssistantError(ctx: any): string | undefined {
-    const sessionEvents = ctx.sessionManager?.getBranch?.() ?? [];
-    for (let i = sessionEvents.length - 1; i >= 0; i--) {
-      const e = sessionEvents[i];
-      if (e.type === "message" && e.message?.role === "assistant") {
-        if (e.message.stopReason === "error") {
-          return typeof e.message.errorMessage === "string" ? e.message.errorMessage : undefined;
-        }
-        break;
-      }
-    }
-    return undefined;
-  }
-
-  function shouldForceSubRefreshOnError(ctx: any): boolean {
-    const provider = normalizeProviderName(ctx.model?.provider);
-    if (!provider) return false;
-
-    // Currently only Anthropic frequently returns recoverable 429 caps where
-    // forcing a usage refresh helps keep quota windows accurate.
-    if (provider !== "anthropic") return false;
-
-    const errorText = (getLatestAssistantError(ctx) ?? "").toLowerCase();
-    if (!errorText) return false;
-    return errorText.includes("rate_limit_error") || errorText.includes("429");
-  }
-
   pi.on("agent_end", async (_event, ctx) => {
     isStreaming = false;
     if (ctx.hasUI) {
       onVibeAgentEnd(ctx.ui.setWorkingMessage); // working-vibes internal state + reset message
-    }
-
-    // If we just hit Anthropic rate-limit, force sub-core refresh (throttled)
-    // to avoid stale quota windows after errors.
-    if (shouldForceSubRefreshOnError(ctx)) {
-      const now = Date.now();
-      if (now - lastForcedSubRefreshAt > 30_000) {
-        lastForcedSubRefreshAt = now;
-        pi.events.emit("sub-core:action", { type: "refresh", force: true });
-      }
     }
   });
 

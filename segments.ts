@@ -48,32 +48,12 @@ function renderProgressBar(percent: number, width = 8): string {
   return `[${"█".repeat(filled)}${"░".repeat(empty)}]`;
 }
 
-function formatResetFromIso(resetAt?: string): string | undefined {
-  if (!resetAt) return undefined;
-  const targetMs = Date.parse(resetAt);
-  if (!Number.isFinite(targetMs)) return undefined;
-
-  const remainingMs = Math.max(0, targetMs - Date.now());
-  const totalMinutes = Math.floor(remainingMs / 60000);
-  const days = Math.floor(totalMinutes / (60 * 24));
-  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
-  const minutes = totalMinutes % 60;
-
-  if (days > 0) {
-    return hours > 0 ? `${days}d${hours}h` : `${days}d`;
-  }
-  if (hours > 0) {
-    return `${hours}h${minutes}m`;
-  }
-  return `${minutes}m`;
-}
-
 function renderSubscriptionWindow(ctx: SegmentContext, window: SegmentContext["subscriptionUsage"]["weekly"]): RenderedSegment {
   if (!window) return { content: "", visible: false };
 
   const pct = Math.round(window.usedPercent);
   const label = window.label?.trim() ?? "Sub";
-  const reset = formatResetFromIso(window.resetAt) ?? window.resetDescription?.trim() ?? "";
+  const reset = window.resetDescription?.trim() ?? "";
   const bar = renderProgressBar(pct);
   const text = reset ? `${label} ${reset}` : label;
   const content = `${text} ${pct}% ${bar}`;
@@ -305,7 +285,6 @@ const costSegment: StatusLineSegment = {
 const sub5HrSegment: StatusLineSegment = {
   id: "sub_5hr",
   render(ctx) {
-    // Local/self-hosted providers should not show hosted subscription quota windows.
     if (ctx.model?.provider === "llamacpp") return { content: "", visible: false };
     return renderSubscriptionWindow(ctx, ctx.subscriptionUsage.fiveHour);
   },
