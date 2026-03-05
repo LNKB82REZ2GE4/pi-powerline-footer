@@ -91,6 +91,13 @@ interface SubCoreEntryState {
   usage?: SubCoreUsageSnapshot;
 }
 
+interface LocalLlmUpdatePayload {
+  modelId?: string;
+  modelName?: string;
+  contextWindow?: number;
+  unavailable?: boolean;
+}
+
 interface SubCoreAllState {
   provider?: string;
   entries?: SubCoreEntryState[];
@@ -190,6 +197,13 @@ function parseAllStatePayload(payload: unknown): SubCoreAllPayload {
   }
 
   return { state: { provider, entries } };
+}
+
+function providerMatches(a?: string, b?: string): boolean {
+  if (!a || !b) return false;
+  const x = a.toLowerCase();
+  const y = b.toLowerCase();
+  return x === y || x.startsWith(y) || y.startsWith(x);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -310,6 +324,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   let lastUserPrompt = ""; // Track last user message for "what did I type?" reminder
   let showLastPrompt = true; // Cached setting for last prompt visibility
   let subscriptionUsage: SubscriptionUsage = {};
+  let localLlmLive: { modelName?: string; contextWindow?: number } | null = null;
   
   // Cache for responsive layout (shared between editor and widget for consistency)
   let lastLayoutWidth = 0;
@@ -362,13 +377,30 @@ export default function powerlineFooter(pi: ExtensionAPI) {
 
   pi.events.on("sub-core:update-all", (payload: unknown) => {
     const data = parseAllStatePayload(payload);
-    const provider = data.state?.provider;
     const entries = data.state?.entries ?? [];
-    const match = provider
-      ? entries.find((entry) => entry.provider === provider)
+    const currentProvider = currentCtx?.model?.provider as string | undefined;
+    const stateProvider = data.state?.provider;
+
+    const preferredProvider = currentProvider ?? stateProvider;
+    const match = preferredProvider
+      ? entries.find((entry) => providerMatches(entry.provider, preferredProvider))
       : entries[0];
 
     updateSubscriptionUsage(match?.usage);
+  });
+
+  pi.events.on("local-llm:update", (payload: unknown) => {
+    const p = payload as LocalLlmUpdatePayload;
+    if (p?.unavailable) {
+      localLlmLive = null;
+    } else {
+      localLlmLive = {
+        modelName: typeof p?.modelName === "string" ? p.modelName : undefined,
+        contextWindow: typeof p?.contextWindow === "number" ? p.contextWindow : undefined,
+      };
+    }
+    lastLayoutResult = null;
+    tuiRef?.requestRender();
   });
 
   // Check if a bash command might change git branch
@@ -678,7 +710,17 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       ? lastAssistant.usage.input + lastAssistant.usage.output +
         lastAssistant.usage.cacheRead + lastAssistant.usage.cacheWrite
       : 0;
-    const contextWindow = ctx.model?.contextWindow || 0;
+
+    const modelForDisplay =
+      ctx.model?.provider === "llamacpp" && localLlmLive
+        ? {
+            ...ctx.model,
+            ...(localLlmLive.modelName ? { name: localLlmLive.modelName } : {}),
+            ...(localLlmLive.contextWindow ? { contextWindow: localLlmLive.contextWindow } : {}),
+          }
+        : ctx.model;
+
+    const contextWindow = modelForDisplay?.contextWindow || 0;
     const contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
 
     // Get git status (cached)
@@ -691,7 +733,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       : false;
 
     return {
-      model: ctx.model,
+      model: modelForDisplay,
       thinkingLevel: thinkingLevelFromSession || getThinkingLevelFn?.() || "off",
       sessionId: ctx.sessionManager?.getSessionId?.(),
       usageStats: { input, output, cacheRead, cacheWrite, cost },
