@@ -127,6 +127,8 @@ export interface UsageStats {
 export interface SubscriptionWindow {
   label?: string;
   resetDescription?: string;
+  /** Optional absolute reset time (ISO8601) from provider API. */
+  resetAt?: string;
   usedPercent: number;
 }
 

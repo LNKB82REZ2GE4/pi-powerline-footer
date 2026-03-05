@@ -85,6 +85,7 @@ interface SubCoreUsageError {
 }
 
 interface SubCoreUsageSnapshot {
+  provider?: string;
   windows?: SubscriptionWindow[];
   error?: SubCoreUsageError;
 }
@@ -138,6 +139,7 @@ function coerceUsageSnapshot(value: unknown): SubCoreUsageSnapshot | undefined {
       usedPercent: boundedPercent,
       label: typeof window.label === "string" ? window.label : undefined,
       resetDescription: typeof window.resetDescription === "string" ? window.resetDescription : undefined,
+      resetAt: typeof window.resetAt === "string" ? window.resetAt : undefined,
     });
   }
 
@@ -150,7 +152,11 @@ function coerceUsageSnapshot(value: unknown): SubCoreUsageSnapshot | undefined {
       }
     : undefined;
 
-  return { windows: parsedWindows, error };
+  return {
+    provider: typeof value.provider === "string" ? value.provider : undefined,
+    windows: parsedWindows,
+    error,
+  };
 }
 
 function pickWindowByLabel(
@@ -189,8 +195,9 @@ function mapSubscriptionUsage(usage: SubCoreUsageSnapshot | undefined): Subscrip
   const isRateLimited =
     usage?.error?.httpStatus === 429 ||
     (usage?.error?.code === "HTTP_ERROR" && /429/.test(usage?.error?.message ?? ""));
+  const isAnthropic = normalizeProviderName(usage?.provider) === "anthropic";
 
-  if (isRateLimited) {
+  if (isAnthropic && isRateLimited) {
     fiveHour = {
       label: fiveHour?.label ?? "5h",
       usedPercent: 100,
@@ -378,6 +385,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   let subscriptionUsage: SubscriptionUsage = {};
   let localLlmLive: { modelName?: string; contextWindow?: number } | null = null;
   let latestSubAllState: { provider?: string; entries: SubCoreEntryState[] } | null = null;
+  let lastForcedSubRefreshAt = 0;
   
   // Cache for responsive layout (shared between editor and widget for consistency)
   let lastLayoutWidth = 0;
@@ -606,10 +614,47 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     }
   }
 
+  function getLatestAssistantError(ctx: any): string | undefined {
+    const sessionEvents = ctx.sessionManager?.getBranch?.() ?? [];
+    for (let i = sessionEvents.length - 1; i >= 0; i--) {
+      const e = sessionEvents[i];
+      if (e.type === "message" && e.message?.role === "assistant") {
+        if (e.message.stopReason === "error") {
+          return typeof e.message.errorMessage === "string" ? e.message.errorMessage : undefined;
+        }
+        break;
+      }
+    }
+    return undefined;
+  }
+
+  function shouldForceSubRefreshOnError(ctx: any): boolean {
+    const provider = normalizeProviderName(ctx.model?.provider);
+    if (!provider) return false;
+
+    // Currently only Anthropic frequently returns recoverable 429 caps where
+    // forcing a usage refresh helps keep quota windows accurate.
+    if (provider !== "anthropic") return false;
+
+    const errorText = (getLatestAssistantError(ctx) ?? "").toLowerCase();
+    if (!errorText) return false;
+    return errorText.includes("rate_limit_error") || errorText.includes("429");
+  }
+
   pi.on("agent_end", async (_event, ctx) => {
     isStreaming = false;
     if (ctx.hasUI) {
       onVibeAgentEnd(ctx.ui.setWorkingMessage); // working-vibes internal state + reset message
+    }
+
+    // If we just hit Anthropic rate-limit, force sub-core refresh (throttled)
+    // to avoid stale quota windows after errors.
+    if (shouldForceSubRefreshOnError(ctx)) {
+      const now = Date.now();
+      if (now - lastForcedSubRefreshAt > 30_000) {
+        lastForcedSubRefreshAt = now;
+        pi.events.emit("sub-core:action", { type: "refresh", force: true });
+      }
     }
   });
 
