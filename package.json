@@ -29,7 +29,7 @@
   "pi": {
     "extensions": [
       "./index.ts",
-      "node_modules/@marckrenn/pi-sub-core/index.ts"
+      "./sub-core-wrapper.ts"
     ]
   },
   "dependencies": {
