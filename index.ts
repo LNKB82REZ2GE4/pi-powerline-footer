@@ -91,6 +91,7 @@ interface SubCoreUsageSnapshot {
 }
 
 interface SubCoreState {
+  provider?: string;
   usage?: SubCoreUsageSnapshot;
 }
 
@@ -216,7 +217,12 @@ function parseCurrentStatePayload(payload: unknown): SubCoreCurrentPayload {
   if (!isObject(payload)) return {};
   const state = payload.state;
   if (!isObject(state)) return {};
-  return { state: { usage: coerceUsageSnapshot(state.usage) } };
+  return {
+    state: {
+      provider: typeof state.provider === "string" ? state.provider : undefined,
+      usage: coerceUsageSnapshot(state.usage),
+    },
+  };
 }
 
 function parseAllStatePayload(payload: unknown): SubCoreAllPayload {
@@ -430,6 +436,15 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     tuiRef?.requestRender();
   };
 
+  const shouldAcceptUsageForCurrentProvider = (payloadProvider?: string, usageProvider?: string): boolean => {
+    const currentProvider = normalizeProviderName(currentCtx?.model?.provider as string | undefined);
+    if (!currentProvider) return true;
+
+    const candidate = normalizeProviderName(payloadProvider) ?? normalizeProviderName(usageProvider);
+    if (!candidate) return false;
+    return providerMatches(candidate, currentProvider);
+  };
+
   const remapSubscriptionFromLatestAllState = (): void => {
     const state = latestSubAllState;
     if (!state) return;
@@ -442,26 +457,30 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       ? entries.find((entry) => providerMatches(entry.provider, currentProvider))
       : undefined;
 
-    // 2) Fall back to provider indicated by sub-core state
-    if (!match && state.provider) {
+    // 2) Fall back to provider indicated by sub-core state only if it matches current
+    if (!match && state.provider && shouldAcceptUsageForCurrentProvider(state.provider, undefined)) {
       match = entries.find((entry) => providerMatches(entry.provider, state.provider));
     }
 
-    // 3) Last resort: first entry
+    // If we couldn't find a matching entry for the active provider, hide bars
+    // instead of showing another provider's stale quota windows.
     if (!match) {
-      match = entries[0];
+      updateSubscriptionUsage(undefined);
+      return;
     }
 
-    updateSubscriptionUsage(match?.usage);
+    updateSubscriptionUsage(match.usage);
   };
 
   pi.events.on("sub-core:ready", (payload: unknown) => {
     const data = parseCurrentStatePayload(payload);
+    if (!shouldAcceptUsageForCurrentProvider(data.state?.provider, data.state?.usage?.provider)) return;
     updateSubscriptionUsage(data.state?.usage);
   });
 
   pi.events.on("sub-core:update-current", (payload: unknown) => {
     const data = parseCurrentStatePayload(payload);
+    if (!shouldAcceptUsageForCurrentProvider(data.state?.provider, data.state?.usage?.provider)) return;
     updateSubscriptionUsage(data.state?.usage);
   });
 
@@ -494,6 +513,13 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     remapSubscriptionFromLatestAllState();
     lastLayoutResult = null;
     tuiRef?.requestRender();
+
+    // Request a fresh provider-specific snapshot after model switch.
+    const now = Date.now();
+    if (now - lastForcedSubRefreshAt > 10_000) {
+      lastForcedSubRefreshAt = now;
+      pi.events.emit("sub-core:action", { type: "refresh", force: true });
+    }
   });
 
   pi.on("session_switch", async (_event, ctx) => {
@@ -501,6 +527,12 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     remapSubscriptionFromLatestAllState();
     lastLayoutResult = null;
     tuiRef?.requestRender();
+
+    const now = Date.now();
+    if (now - lastForcedSubRefreshAt > 10_000) {
+      lastForcedSubRefreshAt = now;
+      pi.events.emit("sub-core:action", { type: "refresh", force: true });
+    }
   });
 
   // Check if a bash command might change git branch
