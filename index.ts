@@ -78,8 +78,15 @@ function readShowLastPromptSetting(): boolean {
   return true;
 }
 
+interface SubCoreUsageError {
+  code?: string;
+  message?: string;
+  httpStatus?: number;
+}
+
 interface SubCoreUsageSnapshot {
   windows?: SubscriptionWindow[];
+  error?: SubCoreUsageError;
 }
 
 interface SubCoreState {
@@ -134,7 +141,16 @@ function coerceUsageSnapshot(value: unknown): SubCoreUsageSnapshot | undefined {
     });
   }
 
-  return { windows: parsedWindows };
+  const errorValue = value.error;
+  const error = isObject(errorValue)
+    ? {
+        code: typeof errorValue.code === "string" ? errorValue.code : undefined,
+        message: typeof errorValue.message === "string" ? errorValue.message : undefined,
+        httpStatus: typeof errorValue.httpStatus === "number" ? errorValue.httpStatus : undefined,
+      }
+    : undefined;
+
+  return { windows: parsedWindows, error };
 }
 
 function pickWindowByLabel(
@@ -158,7 +174,7 @@ function mapSubscriptionUsage(usage: SubCoreUsageSnapshot | undefined): Subscrip
   const fallbackWeekly = windows[1];
   const fallbackMonthly = windows[2];
 
-  const fiveHour = explicitFiveHour ?? tokenWindow ?? fallbackFiveHour;
+  let fiveHour = explicitFiveHour ?? tokenWindow ?? fallbackFiveHour;
   const weekly = explicitWeekly ?? fallbackWeekly;
   const monthly = explicitMonthly ?? fallbackMonthly;
 
@@ -167,6 +183,20 @@ function mapSubscriptionUsage(usage: SubCoreUsageSnapshot | undefined): Subscrip
     tokenWindow && monthly && !explicitWeekly
       ? { ...monthly, label: "Monthly tools" }
       : monthly;
+
+  // Anthropic can return HTTP 429 for usage endpoint when capped.
+  // In that case, stale fallback windows are misleading — force 5h to 100%.
+  const isRateLimited =
+    usage?.error?.httpStatus === 429 ||
+    (usage?.error?.code === "HTTP_ERROR" && /429/.test(usage?.error?.message ?? ""));
+
+  if (isRateLimited) {
+    fiveHour = {
+      label: fiveHour?.label ?? "5h",
+      usedPercent: 100,
+      resetDescription: fiveHour?.resetDescription,
+    };
+  }
 
   return {
     fiveHour,
