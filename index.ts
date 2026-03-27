@@ -1236,13 +1236,16 @@ export default function powerlineFooter(pi: ExtensionAPI) {
           ctx.ui.notify(`Current vibe model: ${getVibeModel()}`, "info");
           return;
         }
-        // Validate format (provider/modelId)
         if (!modelSpec.includes("/")) {
           ctx.ui.notify("Invalid model format. Use: provider/modelId (e.g., anthropic/claude-haiku-4-5)", "error");
           return;
         }
-        setVibeModel(modelSpec);
-        ctx.ui.notify(`Vibe model set to: ${modelSpec}`, "info");
+        const persisted = setVibeModel(modelSpec);
+        if (persisted) {
+          ctx.ui.notify(`Vibe model set to: ${modelSpec}`, "info");
+        } else {
+          ctx.ui.notify(`Vibe model set to: ${modelSpec} (not persisted; check settings.json)`, "warning");
+        }
         return;
       }
       
@@ -1257,21 +1260,27 @@ export default function powerlineFooter(pi: ExtensionAPI) {
           ctx.ui.notify("Invalid mode. Use: generate or file", "error");
           return;
         }
-        // Check if file exists when switching to file mode
         const theme = getVibeTheme();
         if (newMode === "file" && theme && !hasVibeFile(theme)) {
           ctx.ui.notify(`No vibe file for "${theme}". Run /vibe generate ${theme} first`, "error");
           return;
         }
-        setVibeMode(newMode);
-        ctx.ui.notify(`Vibe mode set to: ${newMode}`, "info");
+        const persisted = setVibeMode(newMode);
+        if (persisted) {
+          ctx.ui.notify(`Vibe mode set to: ${newMode}`, "info");
+        } else {
+          ctx.ui.notify(`Vibe mode set to: ${newMode} (not persisted; check settings.json)`, "warning");
+        }
         return;
       }
       
       // /vibe generate <theme> [count] - generate vibes and save to file
       if (subcommand === "generate") {
         const theme = parts[1];
-        const count = parseInt(parts[2]) || 100;
+        const parsedCount = Number.parseInt(parts[2] ?? "", 10);
+        const count = Number.isFinite(parsedCount)
+          ? Math.min(Math.max(Math.floor(parsedCount), 1), 500)
+          : 100;
         
         if (!theme) {
           ctx.ui.notify("Usage: /vibe generate <theme> [count]", "error");
@@ -1292,19 +1301,26 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       
       // /vibe off - disable
       if (subcommand === "off") {
-        setVibeTheme(null);
-        ctx.ui.notify("Vibe disabled", "info");
+        const persisted = setVibeTheme(null);
+        if (persisted) {
+          ctx.ui.notify("Vibe disabled", "info");
+        } else {
+          ctx.ui.notify("Vibe disabled (not persisted; check settings.json)", "warning");
+        }
         return;
       }
       
       // /vibe <theme> - set theme (preserve original casing)
-      setVibeTheme(args.trim());
-      const mode = getVibeMode();
       const theme = args.trim();
+      const persisted = setVibeTheme(theme);
+      const mode = getVibeMode();
       if (mode === "file" && !hasVibeFile(theme)) {
-        ctx.ui.notify(`Vibe set to: ${theme} (file mode, but no file found - run /vibe generate ${theme})`, "warning");
-      } else {
+        const suffix = persisted ? "" : " (not persisted; check settings.json)";
+        ctx.ui.notify(`Vibe set to: ${theme} (file mode, but no file found - run /vibe generate ${theme})${suffix}`, "warning");
+      } else if (persisted) {
         ctx.ui.notify(`Vibe set to: ${theme}`, "info");
+      } else {
+        ctx.ui.notify(`Vibe set to: ${theme} (not persisted; check settings.json)`, "warning");
       }
     },
   });
