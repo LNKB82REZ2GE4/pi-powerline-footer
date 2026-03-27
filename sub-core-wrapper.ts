@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import subCore from "@marckrenn/pi-sub-core";
+import subCore from "@marckrenn/pi-sub-core/index.ts";
 import { readFileSync, existsSync, watch } from "node:fs";
 import { join } from "node:path";
 import type { FSWatcher } from "node:fs";
