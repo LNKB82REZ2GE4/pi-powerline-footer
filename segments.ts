@@ -1,5 +1,6 @@
 import { hostname as osHostname } from "node:os";
 import { basename } from "node:path";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import type { RenderedSegment, SegmentContext, SemanticColor, StatusLineSegment, StatusLineSegmentId } from "./types.js";
 import { fg, rainbow, applyColor } from "./theme.js";
 import { getIcons, SEP_DOT, getThinkingText } from "./icons.js";
@@ -80,22 +81,32 @@ const modelSegment: StatusLineSegment = {
     const icons = getIcons();
     const opts = ctx.options.model ?? {};
 
-    let modelName = ctx.model?.name || ctx.model?.id || "no-model";
-    // Strip "Claude " prefix for brevity
-    if (modelName.startsWith("Claude ")) {
-      modelName = modelName.slice(7);
-    }
+    let content: string;
 
-    let content = withIcon(icons.model, modelName);
+    if (ctx.activeProfileIndex !== null && ctx.activeProfileLabel) {
+      content = withIcon(icons.model, ctx.activeProfileLabel);
+    } else {
+      let modelName = ctx.model?.name || ctx.model?.id || "no-model";
+      // Strip "Claude " prefix for brevity
+      if (modelName.startsWith("Claude ")) {
+        modelName = modelName.slice(7);
+      }
 
-    // Add thinking level with dot separator
-    if (opts.showThinkingLevel !== false && ctx.model?.reasoning) {
-      const level = ctx.thinkingLevel || "off";
-      if (level !== "off") {
-        const thinkingText = getThinkingText(level);
-        if (thinkingText) {
-          content += `${SEP_DOT}${thinkingText}`;
+      content = withIcon(icons.model, modelName);
+
+      // Add thinking level with dot separator
+      if (opts.showThinkingLevel !== false && ctx.model?.reasoning) {
+        const level = ctx.thinkingLevel || "off";
+        if (level !== "off") {
+          const thinkingText = getThinkingText(level);
+          if (thinkingText) {
+            content += `${SEP_DOT}${thinkingText}`;
+          }
         }
+      }
+
+      if (ctx.activeProfileIndex !== null) {
+        content += ` (P${ctx.activeProfileIndex + 1})`;
       }
     }
 
@@ -439,18 +450,21 @@ const extensionStatusesSegment: StatusLineSegment = {
     const statuses = ctx.extensionStatuses;
     if (!statuses || statuses.size === 0) return { content: "", visible: false };
 
-    // Join compact statuses with a separator
-    // Notification-style statuses (starting with "[") are shown above the editor instead
+    // Join compact statuses with a separator.
+    // Skip notification-style statuses (shown above editor) and ghost entries
+    // that are only ANSI codes or trailing separators.
     const parts: string[] = [];
     for (const value of statuses.values()) {
-      if (value && !value.trimStart().startsWith('[')) {
-        parts.push(value);
+      if (value && !value.trimStart().startsWith("[") && visibleWidth(value) > 0) {
+        const stripped = value.replace(/(\x1b\[[0-9;]*m|\s|·|[|])+$/, "");
+        if (visibleWidth(stripped) > 0) {
+          parts.push(stripped);
+        }
       }
     }
 
     if (parts.length === 0) return { content: "", visible: false };
 
-    // Statuses already have their own styling applied by the extensions
     const content = parts.join(` ${SEP_DOT} `);
     return { content, visible: true };
   },

@@ -139,8 +139,10 @@ export interface SubscriptionUsage {
 // Context passed to segment render functions
 export interface SegmentContext {
   // From pi-mono
-  model: { id: string; name?: string; reasoning?: boolean; contextWindow?: number } | undefined;
+  model: { id: string; name?: string; reasoning?: boolean; contextWindow?: number; provider?: string } | undefined;
   thinkingLevel: string;
+  activeProfileIndex: number | null;
+  activeProfileLabel: string | null;
   sessionId: string | undefined;
   
   // Computed

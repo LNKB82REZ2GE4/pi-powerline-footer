@@ -1,8 +1,9 @@
-import type { ExtensionAPI, ReadonlyFooterDataProvider, Theme } from "@mariozechner/pi-coding-agent";
+import { copyToClipboard, type ExtensionAPI, type ReadonlyFooterDataProvider, type Theme } from "@mariozechner/pi-coding-agent";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
-import { visibleWidth } from "@mariozechner/pi-tui";
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { type SelectItem, SelectList, truncateToWidth, visibleWidth, Input, fuzzyFilter } from "@mariozechner/pi-tui";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { homedir } from "node:os";
 
 import type {
   ColorScheme,
@@ -35,6 +36,18 @@ import {
   getVibeFileCount,
   generateVibesBatch,
 } from "./working-vibes.js";
+import {
+  type ProfileConfig,
+  findMatchingProfileIndex,
+  getActiveProfileIndex,
+  getProfileDisplayName,
+  getProfilesCache,
+  isThinkingLevel,
+  parseModelSpec,
+  reloadProfiles,
+  saveProfiles,
+  setActiveProfileIndex,
+} from "./profiles.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration
@@ -47,6 +60,268 @@ interface PowerlineConfig {
 let config: PowerlineConfig = {
   preset: "default",
 };
+
+interface PowerlineShortcuts {
+  stashHistory: string;
+  copyEditor: string;
+  cutEditor: string;
+  profileCycle: string;
+  profileSelect: string;
+}
+
+type PowerlineShortcutKey = keyof PowerlineShortcuts;
+
+const STASH_HISTORY_LIMIT = 12;
+const STASH_PREVIEW_WIDTH = 72;
+const DEFAULT_SHORTCUTS: PowerlineShortcuts = {
+  stashHistory: "ctrl+alt+h",
+  copyEditor: "ctrl+alt+c",
+  cutEditor: "ctrl+alt+x",
+  profileCycle: "alt+shift+tab",
+  profileSelect: "ctrl+alt+m",
+};
+const SHORTCUT_KEYS: PowerlineShortcutKey[] = ["stashHistory", "copyEditor", "cutEditor", "profileCycle", "profileSelect"];
+const RESERVED_SHORTCUTS = new Set(["alt+s"]);
+const SHORTCUT_MODIFIERS = new Set(["ctrl", "alt", "shift"]);
+const SHORTCUT_NAMED_KEYS = new Set([
+  "escape", "esc", "enter", "return", "tab", "space", "backspace", "delete", "insert", "clear",
+  "home", "end", "pageup", "pagedown", "up", "down", "left", "right",
+]);
+const SHORTCUT_SYMBOL_KEYS = new Set([
+  "`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/",
+  "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "_", "|", "~", "{", "}", ":", "<", ">", "?",
+]);
+const PROMPT_HISTORY_LIMIT = 100;
+const PROMPT_HISTORY_TRACKED = Symbol.for("powerlinePromptHistoryTracked");
+const PROMPT_HISTORY_STATE_KEY = Symbol.for("powerlinePromptHistoryState");
+
+function getPromptHistoryState(): { savedPromptHistory: string[] } {
+  const globalState = globalThis as any;
+  if (!globalState[PROMPT_HISTORY_STATE_KEY]) {
+    globalState[PROMPT_HISTORY_STATE_KEY] = { savedPromptHistory: [] };
+  }
+  return globalState[PROMPT_HISTORY_STATE_KEY];
+}
+
+function readPromptHistory(editor: any): string[] {
+  const history = editor?.history;
+  if (!Array.isArray(history)) return [];
+
+  const normalized: string[] = [];
+  for (const entry of history) {
+    if (typeof entry !== "string") continue;
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    if (normalized.length > 0 && normalized[normalized.length - 1] === trimmed) continue;
+    normalized.push(trimmed);
+    if (normalized.length >= PROMPT_HISTORY_LIMIT) break;
+  }
+
+  return normalized;
+}
+
+function snapshotPromptHistory(editor: any): void {
+  const history = readPromptHistory(editor);
+  if (history.length > 0) {
+    getPromptHistoryState().savedPromptHistory = [...history];
+  }
+}
+
+function restorePromptHistory(editor: any): void {
+  const { savedPromptHistory } = getPromptHistoryState();
+  if (!savedPromptHistory.length || typeof editor?.addToHistory !== "function") return;
+
+  for (let i = savedPromptHistory.length - 1; i >= 0; i--) {
+    editor.addToHistory(savedPromptHistory[i]);
+  }
+}
+
+function trackPromptHistory(editor: any): void {
+  if (!editor || typeof editor.addToHistory !== "function") return;
+  if ((editor as any)[PROMPT_HISTORY_TRACKED]) {
+    snapshotPromptHistory(editor);
+    return;
+  }
+
+  const originalAddToHistory = editor.addToHistory.bind(editor);
+  editor.addToHistory = (text: string) => {
+    originalAddToHistory(text);
+    snapshotPromptHistory(editor);
+  };
+  (editor as any)[PROMPT_HISTORY_TRACKED] = true;
+  snapshotPromptHistory(editor);
+}
+
+function getSettingsPath(): string {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || homedir();
+  return join(homeDir, ".pi", "agent", "settings.json");
+}
+
+function getStashHistoryPath(): string {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || homedir();
+  return join(homeDir, ".pi", "agent", "powerline-footer", "stash-history.json");
+}
+
+function hasNonWhitespaceText(text: string): boolean {
+  return text.trim().length > 0;
+}
+
+function buildStashPreview(text: string, maxWidth: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) return "(empty)";
+  return truncateWithEllipsisByWidth(compact, maxWidth);
+}
+
+function pushStashHistory(history: string[], text: string): boolean {
+  if (!hasNonWhitespaceText(text)) return false;
+  if (history[0] === text) return false;
+  history.unshift(text);
+  if (history.length > STASH_HISTORY_LIMIT) history.length = STASH_HISTORY_LIMIT;
+  return true;
+}
+
+function normalizeStashHistoryEntries(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const history: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    if (!hasNonWhitespaceText(entry)) continue;
+    if (history[history.length - 1] === entry) continue;
+    history.push(entry);
+    if (history.length >= STASH_HISTORY_LIMIT) break;
+  }
+  return history;
+}
+
+function readPersistedStashHistory(): string[] {
+  const stashHistoryPath = getStashHistoryPath();
+  try {
+    if (!existsSync(stashHistoryPath)) return [];
+    const parsed = JSON.parse(readFileSync(stashHistoryPath, "utf-8"));
+    if (!isObject(parsed)) return [];
+    return normalizeStashHistoryEntries((parsed as any).history);
+  } catch {
+    return [];
+  }
+}
+
+function persistStashHistory(history: string[]): void {
+  const stashHistoryPath = getStashHistoryPath();
+  const payload = { version: 1, history: history.slice(0, STASH_HISTORY_LIMIT) };
+  try {
+    mkdirSync(dirname(stashHistoryPath), { recursive: true });
+    writeFileSync(stashHistoryPath, JSON.stringify(payload, null, 2) + "\n");
+  } catch {}
+}
+
+function readSettings(): Record<string, unknown> {
+  const settingsPath = getSettingsPath();
+  try {
+    if (!existsSync(settingsPath)) return {};
+    const parsed = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    return isObject(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePowerlinePresetSetting(preset: StatusLinePreset): boolean {
+  const settingsPath = getSettingsPath();
+  let settings: Record<string, unknown> = {};
+  if (existsSync(settingsPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(settingsPath, "utf-8"));
+      if (!isObject(parsed)) return false;
+      settings = parsed;
+    } catch {
+      return false;
+    }
+  }
+  settings.powerline = preset;
+  try {
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isValidPreset(value: unknown): value is StatusLinePreset {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(PRESETS, value);
+}
+
+function normalizePreset(value: unknown): StatusLinePreset | null {
+  if (typeof value !== "string") return null;
+  const preset = value.trim().toLowerCase();
+  return isValidPreset(preset) ? preset : null;
+}
+
+function getCurrentEditorText(ctx: any, editor: any): string {
+  return editor?.getExpandedText?.() ?? ctx.ui.getEditorText();
+}
+
+function normalizeShortcut(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isValidShortcutKeyPart(keyPart: string): boolean {
+  const lowerKeyPart = keyPart.toLowerCase();
+  if (/^[a-z0-9]$/i.test(keyPart)) return true;
+  if (/^f([1-9]|1[0-2])$/i.test(keyPart)) return true;
+  if (SHORTCUT_NAMED_KEYS.has(lowerKeyPart)) return true;
+  return SHORTCUT_SYMBOL_KEYS.has(keyPart);
+}
+
+function parseShortcutOverride(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || /\s/.test(trimmed)) return null;
+  const parts = trimmed.split("+");
+  if (parts.some((part) => part.length === 0)) return null;
+  const modifierParts = parts.slice(0, -1).map((part) => part.toLowerCase());
+  if (new Set(modifierParts).size !== modifierParts.length) return null;
+  for (const modifier of modifierParts) if (!SHORTCUT_MODIFIERS.has(modifier)) return null;
+  const keyPart = parts[parts.length - 1];
+  if (!isValidShortcutKeyPart(keyPart)) return null;
+  const normalizedKey = SHORTCUT_SYMBOL_KEYS.has(keyPart) ? keyPart : keyPart.toLowerCase();
+  return [...modifierParts, normalizedKey].join("+");
+}
+
+function findShortcutReplacement(key: PowerlineShortcutKey, used: Set<string>): string | null {
+  const preferred = DEFAULT_SHORTCUTS[key];
+  if (!used.has(normalizeShortcut(preferred))) return preferred;
+  for (const shortcutKey of SHORTCUT_KEYS) {
+    const candidate = DEFAULT_SHORTCUTS[shortcutKey];
+    if (!used.has(normalizeShortcut(candidate))) return candidate;
+  }
+  return null;
+}
+
+function resolveShortcutConfig(settings: Record<string, unknown>): PowerlineShortcuts {
+  const resolved: PowerlineShortcuts = { ...DEFAULT_SHORTCUTS };
+  const shortcutSettings = settings.powerlineShortcuts;
+  if (isObject(shortcutSettings)) {
+    for (const key of SHORTCUT_KEYS) {
+      const override = parseShortcutOverride((shortcutSettings as any)[key]);
+      if (override) resolved[key] = override;
+    }
+  }
+  const used = new Set<string>([...RESERVED_SHORTCUTS]);
+  for (const key of SHORTCUT_KEYS) {
+    const configured = resolved[key];
+    const normalizedConfigured = normalizeShortcut(configured);
+    if (!used.has(normalizedConfigured)) {
+      used.add(normalizedConfigured);
+      continue;
+    }
+    const replacement = findShortcutReplacement(key, used);
+    if (!replacement) continue;
+    resolved[key] = replacement;
+    used.add(normalizeShortcut(replacement));
+  }
+  return resolved;
+}
 
 // Check if quietStartup is enabled in settings
 function isQuietStartup(): boolean {
@@ -226,6 +501,25 @@ function buildContentFromParts(
   return " " + parts.join(` ${sepAnsi}${sep}${ansi.reset} `) + ansi.reset + " ";
 }
 
+function truncateWithEllipsisByWidth(text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return "";
+  if (visibleWidth(text) <= maxWidth) return text;
+  if (maxWidth === 1) return "…";
+
+  const targetWidth = maxWidth - 1;
+  let truncated = "";
+  let truncatedWidth = 0;
+
+  for (const char of text) {
+    const charWidth = visibleWidth(char);
+    if (truncatedWidth + charWidth > targetWidth) break;
+    truncated += char;
+    truncatedWidth += charWidth;
+  }
+
+  return truncated.trimEnd() + "…";
+}
+
 /**
  * Responsive segment layout - fits segments into top bar, overflows to secondary row.
  * When terminal is wide enough, secondary segments move up to top bar.
@@ -303,6 +597,9 @@ function computeResponsiveLayout(
 // ═══════════════════════════════════════════════════════════════════════════
 
 export default function powerlineFooter(pi: ExtensionAPI) {
+  const startupSettings = readSettings();
+  const resolvedShortcuts = resolveShortcutConfig(startupSettings);
+
   let enabled = true;
   let sessionStartTime = Date.now();
   let currentCtx: any = null;
@@ -317,11 +614,128 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   let showLastPrompt = true; // Cached setting for last prompt visibility
   let subscriptionUsage: SubscriptionUsage = {};
   let localLlmLive: { modelName?: string; contextWindow?: number } | null = null;
+  let stashedEditorText: string | null = null;
+  let stashedPromptHistory: string[] = readPersistedStashHistory();
+  let currentEditor: any = null;
+  let profileSwitchInProgress = false;
   
   // Cache for responsive layout (shared between editor and widget for consistency)
   let lastLayoutWidth = 0;
   let lastLayoutResult: { topContent: string; secondaryContent: string } | null = null;
   let lastLayoutTimestamp = 0;
+
+  function getLiveProfileMatchIndex(ctx: any, profiles: ProfileConfig[]): number | null {
+    if (!ctx.model?.provider || !ctx.model?.id) return null;
+    return findMatchingProfileIndex(profiles, ctx.model.provider, ctx.model.id, pi.getThinkingLevel());
+  }
+
+  function reloadAndSyncActiveProfile(ctx: any): void {
+    const profiles = reloadProfiles();
+    const activeIndex = getLiveProfileMatchIndex(ctx, profiles);
+    setActiveProfileIndex(activeIndex);
+  }
+
+  async function runWithProfileSwitchLock(action: () => Promise<void>): Promise<void> {
+    if (profileSwitchInProgress) return;
+    profileSwitchInProgress = true;
+    try {
+      await action();
+    } finally {
+      profileSwitchInProgress = false;
+    }
+  }
+
+  function addStashHistoryEntry(text: string): void {
+    const changed = pushStashHistory(stashedPromptHistory, text);
+    if (!changed) return;
+    persistStashHistory(stashedPromptHistory);
+  }
+
+  function copyTextToClipboard(ctx: any, text: string, successMessage?: string): void {
+    copyToClipboard(text);
+    if (successMessage) ctx.ui.notify(successMessage, "info");
+  }
+
+  function getEditorTextForClipboard(ctx: any): string | null {
+    const text = getCurrentEditorText(ctx, currentEditor);
+    if (hasNonWhitespaceText(text)) return text;
+    ctx.ui.notify("Editor is empty", "info");
+    return null;
+  }
+
+  async function openStashHistory(ctx: any): Promise<void> {
+    if (stashedPromptHistory.length === 0) {
+      ctx.ui.notify("No stashed prompt history yet", "info");
+      return;
+    }
+
+    const options = stashedPromptHistory.map((entry, index) => `#${index + 1} ${buildStashPreview(entry, STASH_PREVIEW_WIDTH)}`);
+    const selected = await ctx.ui.select("Stash history", options);
+    if (!selected) return;
+    const index = options.indexOf(selected);
+    const picked = index >= 0 ? stashedPromptHistory[index] : null;
+    if (!picked) return;
+
+    const currentText = getCurrentEditorText(ctx, currentEditor);
+    if (!hasNonWhitespaceText(currentText)) {
+      ctx.ui.setEditorText(picked);
+      ctx.ui.notify("Inserted stashed prompt", "info");
+      return;
+    }
+
+    const action = await ctx.ui.select("Insert stashed prompt", ["Replace", "Append", "Cancel"]);
+    if (action === "Replace") {
+      ctx.ui.setEditorText(picked);
+      ctx.ui.notify("Replaced editor with stashed prompt", "info");
+    } else if (action === "Append") {
+      const separator = currentText.endsWith("\n") || picked.startsWith("\n") ? "" : "\n";
+      ctx.ui.setEditorText(`${currentText}${separator}${picked}`);
+      ctx.ui.notify("Appended stashed prompt", "info");
+    }
+  }
+
+  async function switchToProfile(ctx: any, profiles: ProfileConfig[], index: number): Promise<boolean> {
+    const profile = profiles[index];
+    if (!profile) return false;
+    const modelSpec = parseModelSpec(profile.model);
+    if (!modelSpec) return false;
+    const model = ctx.modelRegistry.find(modelSpec.provider, modelSpec.modelId);
+    if (!model) {
+      ctx.ui.notify(`Model not found: ${profile.model}`, "warning");
+      return false;
+    }
+    const switched = await pi.setModel(model);
+    if (!switched) {
+      ctx.ui.notify(`No API key for model: ${profile.model}`, "warning");
+      return false;
+    }
+    pi.setThinkingLevel(profile.thinking);
+    setActiveProfileIndex(index);
+    lastLayoutResult = null;
+    const displayName = getProfileDisplayName(profile, model.name);
+    ctx.ui.notify(`Switched to: ${displayName} [${pi.getThinkingLevel()}]`, "info");
+    tuiRef?.requestRender();
+    return true;
+  }
+
+  async function openProfileList(ctx: any, profiles: ProfileConfig[]): Promise<void> {
+    if (profiles.length === 0) {
+      ctx.ui.notify("No profiles configured. Use /model-switcher add to create one.", "info");
+      return;
+    }
+    const activeIndex = getLiveProfileMatchIndex(ctx, profiles);
+    const options = profiles.map((profile, index) => {
+      const active = index === activeIndex ? " ✓" : "";
+      const label = profile.label || profile.model;
+      return `#${index + 1} ${label}${active} [${profile.thinking}]`;
+    });
+    const selected = await ctx.ui.select("Model profiles", options);
+    if (!selected) return;
+    const selectedIndex = options.indexOf(selected);
+    if (selectedIndex >= 0) {
+      await switchToProfile(ctx, profiles, selectedIndex);
+    }
+  }
 
   // Track session start
   pi.on("session_start", async (_event, ctx) => {
@@ -329,26 +743,29 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     currentCtx = ctx;
     lastUserPrompt = "";
     isStreaming = false;
-    showLastPrompt = readShowLastPromptSetting();
     subscriptionUsage = {};
-    
-    // Store thinking level getter if available
-    if (typeof ctx.getThinkingLevel === 'function') {
+
+    const settings = readSettings();
+    showLastPrompt = settings.showLastPrompt !== false;
+    config.preset = normalizePreset(settings.powerline) ?? "default";
+    stashedPromptHistory = readPersistedStashHistory();
+
+    if (typeof ctx.getThinkingLevel === "function") {
       getThinkingLevelFn = () => ctx.getThinkingLevel();
     }
-    
-    // Initialize vibe manager (needs modelRegistry from ctx)
+
     initVibeManager(ctx);
-    
+
     if (enabled && ctx.hasUI) {
       setupCustomEditor(ctx);
-      // quietStartup: true → compact header, otherwise → full overlay
-      if (isQuietStartup()) {
+      if (settings.quietStartup === true) {
         setupWelcomeHeader(ctx);
       } else {
         setupWelcomeOverlay(ctx);
       }
     }
+
+    reloadAndSyncActiveProfile(ctx);
   });
 
   const updateSubscriptionUsage = (usage: SubCoreUsageSnapshot | undefined): void => {
@@ -397,12 +814,25 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   // Keep footer context in sync when switching models quickly (Ctrl+P).
   pi.on("model_select", async (_event, ctx) => {
     currentCtx = ctx;
+    reloadAndSyncActiveProfile(ctx);
     lastLayoutResult = null;
     tuiRef?.requestRender();
   });
 
   pi.on("session_switch", async (_event, ctx) => {
+    sessionStartTime = Date.now();
     currentCtx = ctx;
+    getThinkingLevelFn = typeof ctx.getThinkingLevel === "function" ? () => ctx.getThinkingLevel() : null;
+    lastUserPrompt = "";
+    isStreaming = false;
+    subscriptionUsage = {};
+    stashedEditorText = null;
+    stashedPromptHistory = readPersistedStashHistory();
+    if (ctx.hasUI) {
+      ctx.ui.setStatus("stash", undefined);
+    }
+    dismissWelcome(ctx);
+    reloadAndSyncActiveProfile(ctx);
     lastLayoutResult = null;
     tuiRef?.requestRender();
   });
@@ -522,6 +952,16 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     isStreaming = false;
     if (ctx.hasUI) {
       onVibeAgentEnd(ctx.ui.setWorkingMessage); // working-vibes internal state + reset message
+      if (stashedEditorText !== null) {
+        if (ctx.ui.getEditorText().trim() === "") {
+          ctx.ui.setEditorText(stashedEditorText);
+          stashedEditorText = null;
+          ctx.ui.setStatus("stash", undefined);
+          ctx.ui.notify("Stash restored", "info");
+        } else {
+          ctx.ui.notify("Stash preserved — clear editor then Alt+S to restore", "info");
+        }
+      }
     }
   });
 
@@ -537,14 +977,16 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       // Update context reference (command ctx may have more methods)
       currentCtx = ctx;
       
-      if (!args) {
-        // Toggle
+      if (!args?.trim()) {
         enabled = !enabled;
         if (enabled) {
           setupCustomEditor(ctx);
           ctx.ui.notify("Powerline enabled", "info");
         } else {
-          // Clear all custom UI components
+          getPromptHistoryState().savedPromptHistory = [];
+          stashedEditorText = null;
+          setActiveProfileIndex(null);
+          ctx.ui.setStatus("stash", undefined);
           ctx.ui.setEditorComponent(undefined);
           ctx.ui.setFooter(undefined);
           ctx.ui.setHeader(undefined);
@@ -553,29 +995,216 @@ export default function powerlineFooter(pi: ExtensionAPI) {
           ctx.ui.setWidget("powerline-last-prompt", undefined);
           footerDataRef = null;
           tuiRef = null;
-          // Clear layout cache
+          currentEditor = null;
           lastLayoutResult = null;
-          ctx.ui.notify("Defaults restored", "info");
+          ctx.ui.notify("Powerline disabled", "info");
         }
         return;
       }
 
-      // Check if args is a preset name
-      const preset = args.trim().toLowerCase() as StatusLinePreset;
-      if (preset in PRESETS) {
+      const preset = normalizePreset(args);
+      if (preset) {
         config.preset = preset;
-        // Invalidate layout cache since preset changed
         lastLayoutResult = null;
         if (enabled) {
           setupCustomEditor(ctx);
         }
-        ctx.ui.notify(`Preset set to: ${preset}`, "info");
+        if (writePowerlinePresetSetting(preset)) {
+          ctx.ui.notify(`Preset set to: ${preset}`, "info");
+        } else {
+          ctx.ui.notify(`Preset set to: ${preset} (not persisted; check settings.json)`, "warning");
+        }
         return;
       }
 
       // Show available presets
       const presetList = Object.keys(PRESETS).join(", ");
       ctx.ui.notify(`Available presets: ${presetList}`, "info");
+    },
+  });
+
+  pi.registerCommand("stash-history", {
+    description: "Open stashed prompt history picker",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI) return;
+      if (!enabled) {
+        ctx.ui.notify("Powerline is disabled", "info");
+        return;
+      }
+      await openStashHistory(ctx);
+    },
+  });
+
+  pi.registerShortcut("alt+s", {
+    description: "Stash/restore editor text",
+    handler: async (ctx) => {
+      if (!enabled || !ctx.hasUI) return;
+      const rawText = getCurrentEditorText(ctx, currentEditor);
+      const hasText = hasNonWhitespaceText(rawText);
+      const hasStash = stashedEditorText !== null;
+
+      if (hasText && !hasStash) {
+        stashedEditorText = rawText;
+        addStashHistoryEntry(rawText);
+        ctx.ui.setEditorText("");
+        ctx.ui.setStatus("stash", "📋 stash");
+        ctx.ui.notify("Text stashed", "info");
+        return;
+      }
+      if (!hasText && hasStash) {
+        ctx.ui.setEditorText(stashedEditorText);
+        stashedEditorText = null;
+        ctx.ui.setStatus("stash", undefined);
+        ctx.ui.notify("Stash restored", "info");
+        return;
+      }
+      if (hasText && stashedEditorText !== null) {
+        stashedEditorText = rawText;
+        addStashHistoryEntry(rawText);
+        ctx.ui.setEditorText("");
+        ctx.ui.setStatus("stash", "📋 stash");
+        ctx.ui.notify("Stash updated", "info");
+        return;
+      }
+      ctx.ui.notify("Nothing to stash", "info");
+    },
+  });
+
+  pi.registerShortcut(resolvedShortcuts.stashHistory as any, {
+    description: "Open stash history picker",
+    handler: async (ctx) => {
+      if (!enabled || !ctx.hasUI) return;
+      await openStashHistory(ctx);
+    },
+  });
+
+  pi.registerShortcut(resolvedShortcuts.copyEditor as any, {
+    description: "Copy full editor text",
+    handler: async (ctx) => {
+      if (!enabled || !ctx.hasUI) return;
+      const text = getEditorTextForClipboard(ctx);
+      if (!text) return;
+      copyTextToClipboard(ctx, text, "Copied editor text");
+    },
+  });
+
+  pi.registerShortcut(resolvedShortcuts.cutEditor as any, {
+    description: "Cut full editor text",
+    handler: async (ctx) => {
+      if (!enabled || !ctx.hasUI) return;
+      const text = getEditorTextForClipboard(ctx);
+      if (!text) return;
+      copyTextToClipboard(ctx, text);
+      ctx.ui.setEditorText("");
+      ctx.ui.notify("Cut editor text", "info");
+    },
+  });
+
+  pi.registerShortcut(resolvedShortcuts.profileCycle as any, {
+    description: "Cycle to next model profile",
+    handler: async (ctx) => {
+      if (!enabled || !ctx.hasUI) return;
+      await runWithProfileSwitchLock(async () => {
+        const profiles = reloadProfiles();
+        if (profiles.length === 0) return;
+        const currentMatch = getLiveProfileMatchIndex(ctx, profiles);
+        const startIndex = currentMatch !== null ? (currentMatch + 1) % profiles.length : 0;
+        for (let attempt = 0; attempt < profiles.length; attempt++) {
+          const candidateIndex = (startIndex + attempt) % profiles.length;
+          const switched = await switchToProfile(ctx, profiles, candidateIndex);
+          if (switched) return;
+        }
+        ctx.ui.notify("No available profiles", "warning");
+      });
+    },
+  });
+
+  pi.registerShortcut(resolvedShortcuts.profileSelect as any, {
+    description: "Select and switch model profile",
+    handler: async (ctx) => {
+      if (!enabled || !ctx.hasUI) return;
+      await runWithProfileSwitchLock(async () => {
+        const profiles = reloadProfiles();
+        await openProfileList(ctx, profiles);
+      });
+    },
+  });
+
+  pi.registerCommand("model-switcher", {
+    description: "Manage model profiles. Usage: /model-switcher [add|remove|<number>]",
+    handler: async (args, ctx) => {
+      const trimmed = args?.trim() ?? "";
+      const profiles = reloadProfiles();
+
+      if (!trimmed) {
+        await openProfileList(ctx, profiles);
+        return;
+      }
+
+      const parts = trimmed.split(/\s+/);
+      const subcommand = parts[0]?.toLowerCase();
+
+      if (subcommand === "add") {
+        if (parts.length < 3) {
+          ctx.ui.notify("Usage: /model-switcher add <provider/modelId> <thinking> [label...]", "error");
+          return;
+        }
+        const model = parts[1];
+        const thinking = parts[2].toLowerCase();
+        if (!parseModelSpec(model)) {
+          ctx.ui.notify("Invalid model format. Use: provider/modelId", "error");
+          return;
+        }
+        if (!isThinkingLevel(thinking)) {
+          ctx.ui.notify("Invalid thinking level. Use: off|minimal|low|medium|high|xhigh", "error");
+          return;
+        }
+        const label = parts.slice(3).join(" ").trim();
+        const nextProfiles: ProfileConfig[] = [...profiles, { model, thinking, ...(label ? { label } : {}) }];
+        const saved = saveProfiles(nextProfiles);
+        if (!saved) {
+          ctx.ui.notify("Failed to save profiles", "warning");
+          return;
+        }
+        ctx.ui.notify(`Added profile #${nextProfiles.length}`, "info");
+        return;
+      }
+
+      if (subcommand === "remove") {
+        if (parts.length !== 2) {
+          ctx.ui.notify("Usage: /model-switcher remove <number>", "error");
+          return;
+        }
+        const indexValue = Number.parseInt(parts[1], 10);
+        if (!Number.isFinite(indexValue) || indexValue < 1 || indexValue > profiles.length) {
+          ctx.ui.notify("Invalid profile number", "error");
+          return;
+        }
+        const removeIndex = indexValue - 1;
+        const nextProfiles = profiles.filter((_, index) => index !== removeIndex);
+        const saved = saveProfiles(nextProfiles);
+        if (!saved) {
+          ctx.ui.notify("Failed to save profiles", "warning");
+          return;
+        }
+        setActiveProfileIndex(null);
+        ctx.ui.notify(`Removed profile #${indexValue}`, "info");
+        return;
+      }
+
+      const indexValue = Number.parseInt(subcommand, 10);
+      if (Number.isFinite(indexValue) && parts.length === 1) {
+        if (indexValue < 1 || indexValue > profiles.length) {
+          ctx.ui.notify("Invalid profile number", "error");
+          return;
+        }
+        await runWithProfileSwitchLock(async () => {
+          await switchToProfile(ctx, profiles, indexValue - 1);
+        });
+        return;
+      }
+
+      ctx.ui.notify("Usage: /model-switcher | /model-switcher add <model> <thinking> [label] | /model-switcher remove <N> | /model-switcher <N>", "error");
     },
   });
 
@@ -736,9 +1365,20 @@ export default function powerlineFooter(pi: ExtensionAPI) {
       ? ctx.modelRegistry?.isUsingOAuth?.(ctx.model) ?? false
       : false;
 
+    const thinkingLevel = thinkingLevelFromSession || getThinkingLevelFn?.() || "off";
+    const profilesCache = getProfilesCache();
+    const activeProfileMatch = ctx.model?.provider && ctx.model?.id
+      ? findMatchingProfileIndex(profilesCache, ctx.model.provider, ctx.model.id, thinkingLevel)
+      : null;
+    const activeProfileLabel = activeProfileMatch !== null
+      ? profilesCache[activeProfileMatch]?.label ?? null
+      : null;
+
     return {
       model: modelForDisplay,
-      thinkingLevel: thinkingLevelFromSession || getThinkingLevelFn?.() || "off",
+      thinkingLevel,
+      activeProfileIndex: activeProfileMatch,
+      activeProfileLabel,
       sessionId: ctx.sessionManager?.getSessionId?.(),
       usageStats: { input, output, cacheRead, cacheWrite, cost },
       subscriptionUsage,
@@ -777,20 +1417,23 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   }
 
   function setupCustomEditor(ctx: any) {
+    snapshotPromptHistory(currentEditor);
     // Import CustomEditor dynamically and create wrapper
     import("@mariozechner/pi-coding-agent").then(({ CustomEditor }) => {
-      let currentEditor: any = null;
       let autocompleteFixed = false;
 
       const editorFactory = (tui: any, editorTheme: any, keybindings: any) => {
         // Create custom editor that overrides render for status bar below content
         const editor = new CustomEditor(tui, editorTheme, keybindings);
         currentEditor = editor;
+        trackPromptHistory(editor);
+        restorePromptHistory(editor);
         
         const originalHandleInput = editor.handleInput.bind(editor);
         editor.handleInput = (data: string) => {
           if (!autocompleteFixed && !(editor as any).autocompleteProvider) {
             autocompleteFixed = true;
+            snapshotPromptHistory(editor);
             ctx.ui.setEditorComponent(editorFactory);
             currentEditor?.handleInput(data);
             return;
